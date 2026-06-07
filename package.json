@@ -1,0 +1,12 @@
+{
+  "name": "arb-scanner",
+  "version": "1.0.0",
+  "description": "CEX + DEX Arbitrage Scanner — Kraken, Coinbase, KuCoin, Gate, MEXC",
+  "main": "scanner.js",
+  "scripts": {
+    "start": "node scanner.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
