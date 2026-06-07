@@ -10,7 +10,8 @@ const https = require("https");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const CONFIG = {
-  minSpreadPercent: parseFloat(process.env.MIN_SPREAD || "2.0"),
+  minSpreadPercent: parseFloat(process.env.MIN_SPREAD || "5.0"),
+  maxSpreadPercent: parseFloat(process.env.MAX_SPREAD || "50.0"),
   pollIntervalMs:   parseInt(process.env.POLL_INTERVAL_MS || "60000"), // 60s recommended for large scans
   minExchanges:     parseInt(process.env.MIN_EXCHANGES || "2"),         // coin must appear on at least 2 exchanges
   alertCooldownMs:  10 * 60 * 1000,                                     // 10 min cooldown per pair
@@ -232,7 +233,7 @@ function findOpportunities(allPrices) {
     const mostExpensive = sorted[sorted.length - 1];
     const spread = ((mostExpensive.price - cheapest.price) / cheapest.price) * 100;
 
-    if (spread >= CONFIG.minSpreadPercent) {
+    if (spread >= CONFIG.minSpreadPercent && spread <= CONFIG.maxSpreadPercent) {
       opportunities.push({
         symbol: sym,
         buyAt: cheapest,
@@ -346,11 +347,12 @@ async function scan() {
   console.log(`  Unique coins found:   ${uniqueCoins.toLocaleString()}`);
   console.log(`  Fetch time:           ${elapsed}s`);
 
-  console.log(`\n🔎 Scanning for ${CONFIG.minSpreadPercent}%+ spreads...`);
+  console.log(`
+🔎 Scanning for ${CONFIG.minSpreadPercent}%–${CONFIG.maxSpreadPercent}% spreads...`);
   const opportunities = findOpportunities(allPrices);
 
   if (opportunities.length === 0) {
-    console.log(`  ✅ No opportunities above ${CONFIG.minSpreadPercent}% found this cycle.`);
+    console.log(`  ✅ No opportunities in ${CONFIG.minSpreadPercent}%–${CONFIG.maxSpreadPercent}% range found this cycle.`);
   } else {
     console.log(`  🎯 ${opportunities.length} opportunit${opportunities.length === 1 ? "y" : "ies"} found!\n`);
 
@@ -385,6 +387,7 @@ console.log("══════════════════════�
 console.log("  CEX Arbitrage Scanner v3 — Auto Discovery Mode");
 console.log("  Exchanges: Binance, MEXC, Gate.io, KuCoin, Kraken, Coinbase");
 console.log(`  Min spread:    ${CONFIG.minSpreadPercent}%`);
+  console.log(`  Max spread:    ${CONFIG.maxSpreadPercent}%`);
 console.log(`  Scan interval: ${CONFIG.pollIntervalMs / 1000}s`);
 console.log(`  Min exchanges: ${CONFIG.minExchanges} (coin must appear on at least ${CONFIG.minExchanges})`);
 console.log("  No manual coin list — ALL pairs fetched automatically");
