@@ -213,6 +213,52 @@ async function fetchCoinbase() {
   return prices;
 }
 
+// ─── DEX Fetcher (via DexScreener) ───────────────────────────────────────────
+// Aggregates prices from Uniswap, Velodrome, PancakeSwap, Raydium, and 100s more
+async function fetchDEX() {
+  const prices = {};
+  try {
+    const chains = ["ethereum", "bsc", "solana", "arbitrum", "base", "polygon"];
+    await Promise.all(chains.map(async (chain) => {
+      try {
+        const data = await httpGet(
+          `https://api.dexscreener.com/latest/dex/search?q=USDT&chainId=${chain}`
+        );
+        const pairs = data?.pairs || [];
+        for (const pair of pairs) {
+          if (!pair.baseToken?.symbol || !pair.priceUsd) continue;
+          const sym = pair.baseToken.symbol.toUpperCase();
+          const price = parseFloat(pair.priceUsd);
+          if (price > 0 && !prices[sym]) prices[sym] = price;
+        }
+      } catch (e) { /* skip chain */ }
+    }));
+
+    // Top trending tokens on DexScreener
+    try {
+      const trending = await httpGet("https://api.dexscreener.com/token-profiles/latest/v1");
+      const items = Array.isArray(trending) ? trending : [];
+      await Promise.all(items.slice(0, 20).map(async (item) => {
+        if (!item.tokenAddress || !item.chainId) return;
+        try {
+          const tokenData = await httpGet(
+            `https://api.dexscreener.com/latest/dex/tokens/${item.tokenAddress}`
+          );
+          const pairs = tokenData?.pairs || [];
+          if (pairs.length > 0 && pairs[0].priceUsd) {
+            const sym = pairs[0].baseToken?.symbol?.toUpperCase();
+            const price = parseFloat(pairs[0].priceUsd);
+            if (sym && price > 0 && !prices[sym]) prices[sym] = price;
+          }
+        } catch (e) { /* skip */ }
+      }));
+    } catch (e) { /* skip trending */ }
+
+    console.log(`  ✅ DEX (DexScreener): ${Object.keys(prices).length} pairs`);
+  } catch (e) { console.error(`  ❌ DEX: ${e.message}`); }
+  return prices;
+}
+
 // ─── Find Opportunities ───────────────────────────────────────────────────────
 function findOpportunities(allPrices) {
   const exchangeNames = Object.keys(allPrices);
@@ -330,13 +376,14 @@ async function scan() {
   console.log(`${"═".repeat(55)}`);
   console.log("📡 Fetching all tickers...");
 
-  const [binance, mexc, gate, kucoin, kraken, coinbase] = await Promise.allSettled([
+  const [binance, mexc, gate, kucoin, kraken, coinbase, dex] = await Promise.allSettled([
     fetchBinance(),
     fetchMEXC(),
     fetchGate(),
     fetchKuCoin(),
     fetchKraken(),
     fetchCoinbase(),
+    fetchDEX(),
   ]);
 
   const allPrices = {
@@ -346,6 +393,7 @@ async function scan() {
     KuCoin:    kucoin.status    === "fulfilled" ? kucoin.value    : {},
     Kraken:    kraken.status    === "fulfilled" ? kraken.value    : {},
     Coinbase:  coinbase.status  === "fulfilled" ? coinbase.value  : {},
+    "DEX":     dex.status       === "fulfilled" ? dex.value       : {},
   };
 
   const totalPrices  = Object.values(allPrices).reduce((s, ex) => s + Object.keys(ex).length, 0);
