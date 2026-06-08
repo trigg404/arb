@@ -230,16 +230,14 @@ const CHAIN_IDS = [
 // Cache to share data between fetchDEX and fetchCrossChain
 let _lastChainData = null;
 
-// GeckoTerminal API — free, no API key, works from cloud servers
-// Maps our chain labels to GeckoTerminal network IDs
 const GECKO_CHAINS = [
-  { id: "eth",      label: "ETH"     },
-  { id: "bsc",      label: "BSC"     },
-  { id: "arbitrum", label: "ARB"     },
-  { id: "base",     label: "BASE"    },
+  { id: "eth",         label: "ETH"     },
+  { id: "bsc",         label: "BSC"     },
+  { id: "arbitrum",    label: "ARB"     },
+  { id: "base",        label: "BASE"    },
   { id: "polygon_pos", label: "POLYGON" },
-  { id: "avax",     label: "AVAX"    },
-  { id: "solana",   label: "SOL"     },
+  { id: "avax",        label: "AVAX"    },
+  { id: "solana",      label: "SOL"     },
 ];
 
 const SKIP_SYMS = new Set([
@@ -248,48 +246,72 @@ const SKIP_SYMS = new Set([
   "LUSD","CRVUSD","SUSD","MUSD","EURC","FDUSD",
 ]);
 
+// CoinGecko per-chain top tokens — less likely to block cloud IPs
 async function fetchChainPrices(geckoId, label) {
   const priceMap = {};
   try {
-    // GeckoTerminal: top pools by volume on this network, page 1 + 2 = 40 pools
-    const pages = await Promise.allSettled([
-      httpGet(`https://api.geckoterminal.com/api/v2/networks/${geckoId}/pools?page=1&sort=h24_volume_usd_liquidity_desc`),
-      httpGet(`https://api.geckoterminal.com/api/v2/networks/${geckoId}/pools?page=2&sort=h24_volume_usd_liquidity_desc`),
-    ]);
-
-    for (const page of pages) {
-      if (page.status !== "fulfilled") continue;
-      const pools = page.value?.data || [];
-      for (const pool of pools) {
-        const attrs = pool.attributes || {};
-        const baseSymbol = attrs.base_token_symbol?.toUpperCase();
-        const priceUsd = parseFloat(attrs.base_token_price_usd);
-        const liquidity = parseFloat(attrs.reserve_in_usd || "0");
-
-        if (!baseSymbol || !priceUsd || priceUsd <= 0) continue;
-        if (SKIP_SYMS.has(baseSymbol) || baseSymbol.includes("USD")) continue;
-        if (liquidity < 5000) continue; // min $5k liquidity
-
-        if (!priceMap[baseSymbol] || liquidity > (priceMap[baseSymbol].liq || 0)) {
-          priceMap[baseSymbol] = { price: priceUsd, liq: liquidity };
-        }
+    // CoinGecko: top tokens by market cap on this chain, returns price in USD
+    const data = await httpGet(
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${geckoId}_ecosystem&order=volume_desc&per_page=250&page=1&sparkline=false`,
+      { "Accept": "application/json" }
+    );
+    if (Array.isArray(data)) {
+      for (const coin of data) {
+        const sym = coin.symbol?.toUpperCase();
+        const price = coin.current_price;
+        if (!sym || !price || price <= 0) continue;
+        if (SKIP_SYMS.has(sym) || sym.includes("USD")) continue;
+        priceMap[sym] = price;
       }
     }
-
-    const flat = {};
-    for (const [sym, v] of Object.entries(priceMap)) flat[sym] = v.price;
-    console.log(`  ✅ DEX ${label}: ${Object.keys(flat).length} pairs`);
-    return flat;
+    console.log(`  ✅ DEX ${label}: ${Object.keys(priceMap).length} tokens`);
+    return priceMap;
   } catch (e) {
-    console.error(`  ❌ DEX ${label}: ${e.message}`);
-    return {};
+    // Fallback: try GeckoTerminal
+    try {
+      const pages = await Promise.allSettled([
+        httpGet(`https://api.geckoterminal.com/api/v2/networks/${geckoId}/pools?page=1&sort=h24_volume_usd_liquidity_desc`),
+        httpGet(`https://api.geckoterminal.com/api/v2/networks/${geckoId}/pools?page=2&sort=h24_volume_usd_liquidity_desc`),
+      ]);
+      for (const page of pages) {
+        if (page.status !== "fulfilled") continue;
+        const pools = page.value?.data || [];
+        for (const pool of pools) {
+          const attrs = pool.attributes || {};
+          const sym = attrs.base_token_symbol?.toUpperCase();
+          const price = parseFloat(attrs.base_token_price_usd);
+          const liq = parseFloat(attrs.reserve_in_usd || "0");
+          if (!sym || !price || price <= 0) continue;
+          if (SKIP_SYMS.has(sym) || sym.includes("USD")) continue;
+          if (liq < 5000) continue;
+          if (!priceMap[sym]) priceMap[sym] = price;
+        }
+      }
+      console.log(`  ✅ DEX ${label} (fallback): ${Object.keys(priceMap).length} tokens`);
+      return priceMap;
+    } catch (e2) {
+      console.error(`  ❌ DEX ${label}: ${e2.message}`);
+      return {};
+    }
   }
 }
 
-// Fetch all chains once and cache
+// CoinGecko ecosystem category IDs per chain
+const COINGECKO_CATEGORIES = {
+  "ETH":     "ethereum-ecosystem",
+  "BSC":     "binance-smart-chain",
+  "ARB":     "arbitrum-ecosystem",
+  "BASE":    "base-ecosystem",
+  "POLYGON": "polygon-ecosystem",
+  "AVAX":    "avalanche-ecosystem",
+  "SOL":     "solana-ecosystem",
+};
+
 async function fetchAllChains() {
   const results = await Promise.allSettled(
-    GECKO_CHAINS.map(({ id, label }) => fetchChainPrices(id, label))
+    GECKO_CHAINS.map(({ label }) =>
+      fetchChainPrices(COINGECKO_CATEGORIES[label], label)
+    )
   );
   const chainData = {};
   GECKO_CHAINS.forEach(({ label }, i) => {
@@ -323,7 +345,6 @@ async function fetchDEX() {
 async function fetchCrossChain() {
   return _lastChainData || await fetchAllChains();
 }
-
 // ─── Bridge Cost Estimates ────────────────────────────────────────────────────
 const BRIDGE_COSTS = {
   "ETH-ARB":      { cost: 2,  time: "2-5 min",   bridge: "Across / Arbitrum Bridge" },
