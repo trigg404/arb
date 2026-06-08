@@ -213,221 +213,134 @@ async function fetchCoinbase() {
   return prices;
 }
 
-// ─── DEX Fetcher (Uniswap V3, V2, PancakeSwap, Aerodrome subgraphs) ─────────
-async function fetchDEX() {
-  const prices = {};
+// ─── DEX + Cross-Chain Fetcher (via DexScreener per-chain API) ──────────────
+// DexScreener is free, reliable, no API key needed
+// Covers: Ethereum, BSC, Solana, Arbitrum, Base, Polygon, Avalanche, and more
 
-  // GraphQL query — top 1000 pools by TVL, get token prices in USD
-  const query = JSON.stringify({
-    query: `{
-      pools(first: 1000, orderBy: totalValueLockedUSD, orderByDirection: desc,
-            where: {totalValueLockedUSD_gt: "50000"}) {
-        token0 { symbol }
-        token1 { symbol }
-        token0Price
-        token1Price
-        totalValueLockedUSD
-      }
-    }`
-  });
+const CHAIN_IDS = [
+  { id: "ethereum",  label: "ETH"     },
+  { id: "bsc",       label: "BSC"     },
+  { id: "arbitrum",  label: "ARB"     },
+  { id: "base",      label: "BASE"    },
+  { id: "polygon",   label: "POLYGON" },
+  { id: "avalanche", label: "AVAX"    },
+  { id: "solana",    label: "SOL"     },
+];
 
-  // Subgraphs: Uniswap V3 Ethereum, Arbitrum, Base + PancakeSwap BSC + Aerodrome Base
-  const subgraphs = [
-    // Uniswap V3 Ethereum
-    "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3",
-    // Uniswap V3 Arbitrum
-    "https://api.thegraph.com/subgraphs/name/ianlapham/arbitrum-minimal",
-    // Uniswap V3 Base (via Uniswap hosted)
-    "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3-base",
-    // PancakeSwap V3 BSC
-    "https://api.thegraph.com/subgraphs/name/pancakeswap/exchange-v3-bsc",
-  ];
+// Cache to share data between fetchDEX and fetchCrossChain
+let _lastChainData = null;
 
-  const STABLES = new Set(["USDT","USDC","DAI","BUSD","TUSD","FRAX","LUSD","USDP","GUSD","USDD"]);
+// Fetch top pairs for a single chain from DexScreener
+// Uses /tokens/trending + multiple searches to get broad coverage
+async function fetchChainPrices(chainId, label) {
+  const priceMap = {}; // sym -> { price, liq }
+  const SKIP = new Set(["USDT","USDC","DAI","BUSD","TUSD","FRAX","WETH","WBNB",
+                        "WMATIC","WAVAX","WSOL","WBTC","USD","USDD","USDP","GUSD"]);
 
-  async function querySubgraph(url) {
-    const parsed = new URL(url);
-    return new Promise((resolve, reject) => {
-      const body = Buffer.from(query);
-      const req = https.request({
-        hostname: parsed.hostname,
-        path: parsed.pathname,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": body.length,
-        },
-        timeout: 12000,
-      }, (res) => {
-        let data = "";
-        res.on("data", c => data += c);
-        res.on("end", () => {
-          try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
-        });
-      });
-      req.on("error", reject);
-      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-      req.write(body);
-      req.end();
-    });
-  }
-
-  await Promise.all(subgraphs.map(async (url) => {
-    try {
-      const data = await querySubgraph(url);
-      const pools = data?.data?.pools || [];
-      for (const pool of pools) {
-        const sym0 = pool.token0?.symbol?.toUpperCase();
-        const sym1 = pool.token1?.symbol?.toUpperCase();
-        if (!sym0 || !sym1) continue;
-
-        // If one side is a stablecoin, the other side price = token0Price or token1Price
-        if (STABLES.has(sym1) && !STABLES.has(sym0)) {
-          const price = parseFloat(pool.token0Price);
-          if (price > 0 && !prices[sym0]) prices[sym0] = price;
-        } else if (STABLES.has(sym0) && !STABLES.has(sym1)) {
-          const price = parseFloat(pool.token1Price);
-          if (price > 0 && !prices[sym1]) prices[sym1] = price;
+  function processPairs(pairs) {
+    for (const pair of (pairs || [])) {
+      if (!pair.baseToken?.symbol || !pair.priceUsd) continue;
+      const sym = pair.baseToken.symbol.toUpperCase();
+      if (SKIP.has(sym) || sym.includes("USD")) continue;
+      const price = parseFloat(pair.priceUsd);
+      const liq = pair.liquidity?.usd || 0;
+      if (price > 0 && liq > 1000) { // min $1k liquidity
+        if (!priceMap[sym] || liq > (priceMap[sym].liq || 0)) {
+          priceMap[sym] = { price, liq };
         }
       }
-    } catch (e) { /* skip failed subgraph */ }
-  }));
-
-  // Also hit DexScreener for any remaining gaps — broad token search
-  try {
-    const ds = await httpGet("https://api.dexscreener.com/latest/dex/tokens/trending");
-    const pairs = ds?.pairs || [];
-    for (const pair of pairs) {
-      const sym = pair.baseToken?.symbol?.toUpperCase();
-      const price = parseFloat(pair.priceUsd);
-      if (sym && price > 0 && !prices[sym]) prices[sym] = price;
     }
-  } catch(e) { /* skip */ }
-
-  const count = Object.keys(prices).length;
-  if (count > 0) {
-    console.log(`  ✅ DEX (Uniswap/PancakeSwap/Aerodrome): ${count} pairs`);
-  } else {
-    console.error("  ❌ DEX: No prices returned — subgraphs may be down");
   }
-  return prices;
+
+  try {
+    // Query 1: top pairs by volume
+    const d1 = await httpGet(`https://api.dexscreener.com/latest/dex/search?q=USDT&chainId=${chainId}`);
+    processPairs(d1?.pairs);
+
+    // Query 2: top pairs by liquidity  
+    const d2 = await httpGet(`https://api.dexscreener.com/latest/dex/search?q=USDC&chainId=${chainId}`);
+    processPairs(d2?.pairs);
+
+    const flat = {};
+    for (const [sym, v] of Object.entries(priceMap)) flat[sym] = v.price;
+    console.log(`  ✅ DEX ${label}: ${Object.keys(flat).length} pairs`);
+    return flat;
+  } catch (e) {
+    console.error(`  ❌ DEX ${label}: ${e.message}`);
+    return {};
+  }
 }
 
-
-// ─── Cross-Chain DEX Fetcher ──────────────────────────────────────────────────
-// Fetches prices per chain so we can compare same token across chains
-async function fetchCrossChain() {
-  const chainPrices = {}; // { "ETH": { SYM: price }, "BSC": { SYM: price }, ... }
-
-  const STABLES = new Set(["USDT","USDC","DAI","BUSD","TUSD","FRAX","WETH","WBNB","WMATIC","WAVAX","WSOL"]);
-
-  const subgraphs = [
-    { chain: "ETH",     name: "Uniswap V3 Ethereum",  url: "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3" },
-    { chain: "ARB",     name: "Uniswap V3 Arbitrum",  url: "https://api.thegraph.com/subgraphs/name/ianlapham/arbitrum-minimal" },
-    { chain: "BASE",    name: "Uniswap V3 Base",       url: "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3-base" },
-    { chain: "BSC",     name: "PancakeSwap V3",        url: "https://api.thegraph.com/subgraphs/name/pancakeswap/exchange-v3-bsc" },
-    { chain: "POLYGON", name: "QuickSwap Polygon",     url: "https://api.thegraph.com/subgraphs/name/sameepsi/quickswap-v3" },
-  ];
-
-  const query = JSON.stringify({
-    query: `{
-      pools(first: 1000, orderBy: totalValueLockedUSD, orderByDirection: desc,
-            where: {totalValueLockedUSD_gt: "25000"}) {
-        token0 { symbol }
-        token1 { symbol }
-        token0Price
-        token1Price
-        totalValueLockedUSD
-      }
-    }`
+// Fetch all chains once and cache — both fetchDEX and fetchCrossChain use this
+async function fetchAllChains() {
+  const results = await Promise.allSettled(
+    CHAIN_IDS.map(({ id, label }) => fetchChainPrices(id, label))
+  );
+  const chainData = {};
+  CHAIN_IDS.forEach(({ label }, i) => {
+    chainData[label] = results[i].status === "fulfilled" ? results[i].value : {};
   });
 
-  async function querySubgraphChain(url) {
-    const parsed = new URL(url);
-    return new Promise((resolve, reject) => {
-      const body = Buffer.from(query);
-      const req = https.request({
-        hostname: parsed.hostname,
-        path: parsed.pathname,
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Content-Length": body.length },
-        timeout: 12000,
-      }, (res) => {
-        let data = "";
-        res.on("data", c => data += c);
-        res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
-      });
-      req.on("error", reject);
-      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-      req.write(body);
-      req.end();
-    });
-  }
-
-  await Promise.all(subgraphs.map(async ({ chain, name, url }) => {
-    try {
-      const data = await querySubgraphChain(url);
-      const pools = data?.data?.pools || [];
-      const prices = {};
-
-      for (const pool of pools) {
-        const sym0 = pool.token0?.symbol?.toUpperCase();
-        const sym1 = pool.token1?.symbol?.toUpperCase();
-        if (!sym0 || !sym1) continue;
-
-        if (STABLES.has(sym1) && !STABLES.has(sym0)) {
-          const price = parseFloat(pool.token0Price);
-          if (price > 0 && !prices[sym0]) prices[sym0] = price;
-        } else if (STABLES.has(sym0) && !STABLES.has(sym1)) {
-          const price = parseFloat(pool.token1Price);
-          if (price > 0 && !prices[sym1]) prices[sym1] = price;
-        }
-      }
-
-      chainPrices[chain] = prices;
-      console.log(`  ✅ ${name}: ${Object.keys(prices).length} pairs`);
-    } catch (e) {
-      chainPrices[chain] = {};
-      console.error(`  ❌ ${name}: ${e.message}`);
+  // Debug: show how many symbols appear on multiple chains
+  const symCount = {};
+  for (const prices of Object.values(chainData)) {
+    for (const sym of Object.keys(prices)) {
+      symCount[sym] = (symCount[sym] || 0) + 1;
     }
-  }));
+  }
+  const multiChain = Object.values(symCount).filter(c => c >= 2).length;
+  console.log(`  📊 Symbols on 2+ chains: ${multiChain}`);
 
-  return chainPrices;
+  _lastChainData = chainData;
+  return chainData;
+}
+
+async function fetchDEX() {
+  const chainData = _lastChainData || await fetchAllChains();
+  const merged = {};
+  for (const prices of Object.values(chainData)) {
+    for (const [sym, price] of Object.entries(prices)) {
+      if (!merged[sym]) merged[sym] = price;
+    }
+  }
+  return merged;
+}
+
+async function fetchCrossChain() {
+  // Reuse already-fetched chain data from same scan cycle
+  return _lastChainData || await fetchAllChains();
 }
 
 // ─── Bridge Cost Estimates ────────────────────────────────────────────────────
 const BRIDGE_COSTS = {
-  "ETH-ARB":     { cost: 2,  time: "2-5 min",  bridge: "Arbitrum Bridge / Across" },
-  "ETH-BASE":    { cost: 2,  time: "2-5 min",  bridge: "Base Bridge / Across" },
-  "ETH-POLYGON": { cost: 3,  time: "3-7 min",  bridge: "Stargate" },
-  "ETH-BSC":     { cost: 5,  time: "5-15 min", bridge: "Stargate / Wormhole" },
-  "ARB-BASE":    { cost: 1,  time: "2-4 min",  bridge: "Across" },
-  "ARB-POLYGON": { cost: 2,  time: "3-6 min",  bridge: "Stargate" },
-  "ARB-BSC":     { cost: 3,  time: "5-10 min", bridge: "Stargate" },
-  "BASE-POLYGON":{ cost: 2,  time: "3-6 min",  bridge: "Stargate" },
-  "BASE-BSC":    { cost: 3,  time: "5-10 min", bridge: "Stargate" },
-  "BSC-POLYGON": { cost: 2,  time: "3-7 min",  bridge: "Stargate" },
+  "ETH-ARB":      { cost: 2,  time: "2-5 min",   bridge: "Across / Arbitrum Bridge" },
+  "ETH-BASE":     { cost: 2,  time: "2-5 min",   bridge: "Across / Base Bridge"     },
+  "ETH-POLYGON":  { cost: 3,  time: "3-7 min",   bridge: "Stargate"                 },
+  "ETH-BSC":      { cost: 5,  time: "5-15 min",  bridge: "Stargate / Wormhole"      },
+  "ETH-AVAX":     { cost: 4,  time: "5-10 min",  bridge: "Stargate"                 },
+  "ETH-SOL":      { cost: 6,  time: "10-20 min", bridge: "Wormhole"                 },
+  "ARB-BASE":     { cost: 1,  time: "2-4 min",   bridge: "Across"                   },
+  "ARB-POLYGON":  { cost: 2,  time: "3-6 min",   bridge: "Stargate"                 },
+  "ARB-BSC":      { cost: 3,  time: "5-10 min",  bridge: "Stargate"                 },
+  "ARB-AVAX":     { cost: 3,  time: "5-10 min",  bridge: "Stargate"                 },
+  "BASE-POLYGON": { cost: 2,  time: "3-6 min",   bridge: "Stargate"                 },
+  "BASE-BSC":     { cost: 3,  time: "5-10 min",  bridge: "Stargate"                 },
+  "BSC-POLYGON":  { cost: 2,  time: "3-7 min",   bridge: "Stargate"                 },
+  "BSC-SOL":      { cost: 5,  time: "10-20 min", bridge: "Wormhole"                 },
+  "SOL-ETH":      { cost: 6,  time: "10-20 min", bridge: "Wormhole"                 },
 };
 
 function getBridgeCost(chain1, chain2) {
   const key1 = `${chain1}-${chain2}`;
   const key2 = `${chain2}-${chain1}`;
-  return BRIDGE_COSTS[key1] || BRIDGE_COSTS[key2] || { cost: 5, time: "5-15 min", bridge: "Wormhole" };
+  return BRIDGE_COSTS[key1] || BRIDGE_COSTS[key2] || { cost: 6, time: "10-20 min", bridge: "Wormhole" };
 }
 
 // ─── Find Cross-Chain Opportunities ──────────────────────────────────────────
 function findCrossChainOpportunities(chainPrices) {
   const chains = Object.keys(chainPrices);
+  const allSymbols = new Set(chains.flatMap(c => Object.keys(chainPrices[c])));
   const opportunities = [];
-  const checkedSymbols = new Set();
-
-  // Get all symbols that appear on 2+ chains
-  const allSymbols = new Set();
-  for (const chain of chains) {
-    for (const sym of Object.keys(chainPrices[chain])) {
-      allSymbols.add(sym);
-    }
-  }
 
   for (const sym of allSymbols) {
     if (CONFIG.excludeCoins?.has(sym)) continue;
@@ -437,7 +350,6 @@ function findCrossChainOpportunities(chainPrices) {
       const price = chainPrices[chain][sym];
       if (price && price > 0) chainMarkets.push({ chain, price });
     }
-
     if (chainMarkets.length < 2) continue;
 
     const sorted = [...chainMarkets].sort((a, b) => a.price - b.price);
@@ -447,10 +359,9 @@ function findCrossChainOpportunities(chainPrices) {
 
     if (spread < CONFIG.minSpreadPercent || spread > CONFIG.maxSpreadPercent) continue;
 
-    // Estimate net profit on $1000 trade after bridge fees
     const bridge = getBridgeCost(cheapest.chain, mostExpensive.chain);
     const grossProfit = 1000 * (spread / 100);
-    const netProfit = grossProfit - bridge.cost - 5; // $5 estimated gas both sides
+    const netProfit = grossProfit - bridge.cost - 5;
 
     opportunities.push({
       symbol: sym,
@@ -611,6 +522,11 @@ async function scan() {
   console.log(`🔍 Scan #${scanCount} — ${new Date().toISOString()}`);
   console.log(`${"═".repeat(55)}`);
   console.log("📡 Fetching all tickers...");
+
+  // Pre-fetch all chain data once — shared by fetchDEX and fetchCrossChain
+  console.log("\n🌐 Pre-fetching DEX chain data...");
+  _lastChainData = null; // reset cache each scan
+  await fetchAllChains();
 
   const [binance, mexc, gate, kucoin, kraken, coinbase, dex] = await Promise.allSettled([
     fetchBinance(),
