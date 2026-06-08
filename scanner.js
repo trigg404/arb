@@ -14,6 +14,7 @@ const CONFIG = {
   maxSpreadPercent: parseFloat(process.env.MAX_SPREAD || "50.0"),
   pollIntervalMs:   parseInt(process.env.POLL_INTERVAL_MS || "60000"), // 60s recommended for large scans
   minExchanges:     parseInt(process.env.MIN_EXCHANGES || "2"),         // coin must appear on at least 2 exchanges
+  excludeCoins:     new Set((process.env.EXCLUDE_COINS || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean)),
   alertCooldownMs:  10 * 60 * 1000,                                     // 10 min cooldown per pair
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN,
@@ -226,6 +227,7 @@ function findOpportunities(allPrices) {
     }
 
     // Only compare if coin is on enough exchanges
+    if (CONFIG.excludeCoins.has(sym)) continue;
     if (markets.length < CONFIG.minExchanges) continue;
 
     const sorted = [...markets].sort((a, b) => a.price - b.price);
