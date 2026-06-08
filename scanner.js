@@ -230,36 +230,51 @@ const CHAIN_IDS = [
 // Cache to share data between fetchDEX and fetchCrossChain
 let _lastChainData = null;
 
-// Fetch top pairs for a single chain from DexScreener
-// Uses /tokens/trending + multiple searches to get broad coverage
-async function fetchChainPrices(chainId, label) {
-  const priceMap = {}; // sym -> { price, liq }
-  const SKIP = new Set(["USDT","USDC","DAI","BUSD","TUSD","FRAX","WETH","WBNB",
-                        "WMATIC","WAVAX","WSOL","WBTC","USD","USDD","USDP","GUSD"]);
+// GeckoTerminal API — free, no API key, works from cloud servers
+// Maps our chain labels to GeckoTerminal network IDs
+const GECKO_CHAINS = [
+  { id: "eth",      label: "ETH"     },
+  { id: "bsc",      label: "BSC"     },
+  { id: "arbitrum", label: "ARB"     },
+  { id: "base",     label: "BASE"    },
+  { id: "polygon_pos", label: "POLYGON" },
+  { id: "avax",     label: "AVAX"    },
+  { id: "solana",   label: "SOL"     },
+];
 
-  function processPairs(pairs) {
-    for (const pair of (pairs || [])) {
-      if (!pair.baseToken?.symbol || !pair.priceUsd) continue;
-      const sym = pair.baseToken.symbol.toUpperCase();
-      if (SKIP.has(sym) || sym.includes("USD")) continue;
-      const price = parseFloat(pair.priceUsd);
-      const liq = pair.liquidity?.usd || 0;
-      if (price > 0 && liq > 1000) { // min $1k liquidity
-        if (!priceMap[sym] || liq > (priceMap[sym].liq || 0)) {
-          priceMap[sym] = { price, liq };
+const SKIP_SYMS = new Set([
+  "USDT","USDC","DAI","BUSD","TUSD","FRAX","WETH","WBNB","WMATIC",
+  "WAVAX","WSOL","WBTC","USD","USDD","USDP","GUSD","USDE","PYUSD",
+  "LUSD","CRVUSD","SUSD","MUSD","EURC","FDUSD",
+]);
+
+async function fetchChainPrices(geckoId, label) {
+  const priceMap = {};
+  try {
+    // GeckoTerminal: top pools by volume on this network, page 1 + 2 = 40 pools
+    const pages = await Promise.allSettled([
+      httpGet(`https://api.geckoterminal.com/api/v2/networks/${geckoId}/pools?page=1&sort=h24_volume_usd_liquidity_desc`),
+      httpGet(`https://api.geckoterminal.com/api/v2/networks/${geckoId}/pools?page=2&sort=h24_volume_usd_liquidity_desc`),
+    ]);
+
+    for (const page of pages) {
+      if (page.status !== "fulfilled") continue;
+      const pools = page.value?.data || [];
+      for (const pool of pools) {
+        const attrs = pool.attributes || {};
+        const baseSymbol = attrs.base_token_symbol?.toUpperCase();
+        const priceUsd = parseFloat(attrs.base_token_price_usd);
+        const liquidity = parseFloat(attrs.reserve_in_usd || "0");
+
+        if (!baseSymbol || !priceUsd || priceUsd <= 0) continue;
+        if (SKIP_SYMS.has(baseSymbol) || baseSymbol.includes("USD")) continue;
+        if (liquidity < 5000) continue; // min $5k liquidity
+
+        if (!priceMap[baseSymbol] || liquidity > (priceMap[baseSymbol].liq || 0)) {
+          priceMap[baseSymbol] = { price: priceUsd, liq: liquidity };
         }
       }
     }
-  }
-
-  try {
-    // Query 1: top pairs by volume
-    const d1 = await httpGet(`https://api.dexscreener.com/latest/dex/search?q=USDT&chainId=${chainId}`);
-    processPairs(d1?.pairs);
-
-    // Query 2: top pairs by liquidity  
-    const d2 = await httpGet(`https://api.dexscreener.com/latest/dex/search?q=USDC&chainId=${chainId}`);
-    processPairs(d2?.pairs);
 
     const flat = {};
     for (const [sym, v] of Object.entries(priceMap)) flat[sym] = v.price;
@@ -271,17 +286,16 @@ async function fetchChainPrices(chainId, label) {
   }
 }
 
-// Fetch all chains once and cache — both fetchDEX and fetchCrossChain use this
+// Fetch all chains once and cache
 async function fetchAllChains() {
   const results = await Promise.allSettled(
-    CHAIN_IDS.map(({ id, label }) => fetchChainPrices(id, label))
+    GECKO_CHAINS.map(({ id, label }) => fetchChainPrices(id, label))
   );
   const chainData = {};
-  CHAIN_IDS.forEach(({ label }, i) => {
+  GECKO_CHAINS.forEach(({ label }, i) => {
     chainData[label] = results[i].status === "fulfilled" ? results[i].value : {};
   });
 
-  // Debug: show how many symbols appear on multiple chains
   const symCount = {};
   for (const prices of Object.values(chainData)) {
     for (const sym of Object.keys(prices)) {
@@ -307,7 +321,6 @@ async function fetchDEX() {
 }
 
 async function fetchCrossChain() {
-  // Reuse already-fetched chain data from same scan cycle
   return _lastChainData || await fetchAllChains();
 }
 
