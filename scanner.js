@@ -213,49 +213,103 @@ async function fetchCoinbase() {
   return prices;
 }
 
-// ─── DEX Fetcher (via DexScreener) ───────────────────────────────────────────
-// Aggregates prices from Uniswap, Velodrome, PancakeSwap, Raydium, and 100s more
+// ─── DEX Fetcher (Uniswap V3, V2, PancakeSwap, Aerodrome subgraphs) ─────────
 async function fetchDEX() {
   const prices = {};
-  try {
-    const chains = ["ethereum", "bsc", "solana", "arbitrum", "base", "polygon"];
-    await Promise.all(chains.map(async (chain) => {
-      try {
-        const data = await httpGet(
-          `https://api.dexscreener.com/latest/dex/search?q=USDT&chainId=${chain}`
-        );
-        const pairs = data?.pairs || [];
-        for (const pair of pairs) {
-          if (!pair.baseToken?.symbol || !pair.priceUsd) continue;
-          const sym = pair.baseToken.symbol.toUpperCase();
-          const price = parseFloat(pair.priceUsd);
-          if (price > 0 && !prices[sym]) prices[sym] = price;
-        }
-      } catch (e) { /* skip chain */ }
-    }));
 
-    // Top trending tokens on DexScreener
+  // GraphQL query — top 1000 pools by TVL, get token prices in USD
+  const query = JSON.stringify({
+    query: `{
+      pools(first: 1000, orderBy: totalValueLockedUSD, orderByDirection: desc,
+            where: {totalValueLockedUSD_gt: "50000"}) {
+        token0 { symbol }
+        token1 { symbol }
+        token0Price
+        token1Price
+        totalValueLockedUSD
+      }
+    }`
+  });
+
+  // Subgraphs: Uniswap V3 Ethereum, Arbitrum, Base + PancakeSwap BSC + Aerodrome Base
+  const subgraphs = [
+    // Uniswap V3 Ethereum
+    "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3",
+    // Uniswap V3 Arbitrum
+    "https://api.thegraph.com/subgraphs/name/ianlapham/arbitrum-minimal",
+    // Uniswap V3 Base (via Uniswap hosted)
+    "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3-base",
+    // PancakeSwap V3 BSC
+    "https://api.thegraph.com/subgraphs/name/pancakeswap/exchange-v3-bsc",
+  ];
+
+  const STABLES = new Set(["USDT","USDC","DAI","BUSD","TUSD","FRAX","LUSD","USDP","GUSD","USDD"]);
+
+  async function querySubgraph(url) {
+    const parsed = new URL(url);
+    return new Promise((resolve, reject) => {
+      const body = Buffer.from(query);
+      const req = https.request({
+        hostname: parsed.hostname,
+        path: parsed.pathname,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": body.length,
+        },
+        timeout: 12000,
+      }, (res) => {
+        let data = "";
+        res.on("data", c => data += c);
+        res.on("end", () => {
+          try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
+        });
+      });
+      req.on("error", reject);
+      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+      req.write(body);
+      req.end();
+    });
+  }
+
+  await Promise.all(subgraphs.map(async (url) => {
     try {
-      const trending = await httpGet("https://api.dexscreener.com/token-profiles/latest/v1");
-      const items = Array.isArray(trending) ? trending : [];
-      await Promise.all(items.slice(0, 20).map(async (item) => {
-        if (!item.tokenAddress || !item.chainId) return;
-        try {
-          const tokenData = await httpGet(
-            `https://api.dexscreener.com/latest/dex/tokens/${item.tokenAddress}`
-          );
-          const pairs = tokenData?.pairs || [];
-          if (pairs.length > 0 && pairs[0].priceUsd) {
-            const sym = pairs[0].baseToken?.symbol?.toUpperCase();
-            const price = parseFloat(pairs[0].priceUsd);
-            if (sym && price > 0 && !prices[sym]) prices[sym] = price;
-          }
-        } catch (e) { /* skip */ }
-      }));
-    } catch (e) { /* skip trending */ }
+      const data = await querySubgraph(url);
+      const pools = data?.data?.pools || [];
+      for (const pool of pools) {
+        const sym0 = pool.token0?.symbol?.toUpperCase();
+        const sym1 = pool.token1?.symbol?.toUpperCase();
+        if (!sym0 || !sym1) continue;
 
-    console.log(`  ✅ DEX (DexScreener): ${Object.keys(prices).length} pairs`);
-  } catch (e) { console.error(`  ❌ DEX: ${e.message}`); }
+        // If one side is a stablecoin, the other side price = token0Price or token1Price
+        if (STABLES.has(sym1) && !STABLES.has(sym0)) {
+          const price = parseFloat(pool.token0Price);
+          if (price > 0 && !prices[sym0]) prices[sym0] = price;
+        } else if (STABLES.has(sym0) && !STABLES.has(sym1)) {
+          const price = parseFloat(pool.token1Price);
+          if (price > 0 && !prices[sym1]) prices[sym1] = price;
+        }
+      }
+    } catch (e) { /* skip failed subgraph */ }
+  }));
+
+  // Also hit DexScreener for any remaining gaps — broad token search
+  try {
+    const ds = await httpGet("https://api.dexscreener.com/latest/dex/tokens/trending");
+    const pairs = ds?.pairs || [];
+    for (const pair of pairs) {
+      const sym = pair.baseToken?.symbol?.toUpperCase();
+      const price = parseFloat(pair.priceUsd);
+      if (sym && price > 0 && !prices[sym]) prices[sym] = price;
+    }
+  } catch(e) { /* skip */ }
+
+  const count = Object.keys(prices).length;
+  if (count > 0) {
+    console.log(`  ✅ DEX (Uniswap/PancakeSwap/Aerodrome): ${count} pairs`);
+  } else {
+    console.error("  ❌ DEX: No prices returned — subgraphs may be down");
+  }
   return prices;
 }
 
