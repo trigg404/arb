@@ -313,6 +313,161 @@ async function fetchDEX() {
   return prices;
 }
 
+
+// ─── Cross-Chain DEX Fetcher ──────────────────────────────────────────────────
+// Fetches prices per chain so we can compare same token across chains
+async function fetchCrossChain() {
+  const chainPrices = {}; // { "ETH": { SYM: price }, "BSC": { SYM: price }, ... }
+
+  const STABLES = new Set(["USDT","USDC","DAI","BUSD","TUSD","FRAX","WETH","WBNB","WMATIC","WAVAX","WSOL"]);
+
+  const subgraphs = [
+    { chain: "ETH",     name: "Uniswap V3 Ethereum",  url: "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3" },
+    { chain: "ARB",     name: "Uniswap V3 Arbitrum",  url: "https://api.thegraph.com/subgraphs/name/ianlapham/arbitrum-minimal" },
+    { chain: "BASE",    name: "Uniswap V3 Base",       url: "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3-base" },
+    { chain: "BSC",     name: "PancakeSwap V3",        url: "https://api.thegraph.com/subgraphs/name/pancakeswap/exchange-v3-bsc" },
+    { chain: "POLYGON", name: "QuickSwap Polygon",     url: "https://api.thegraph.com/subgraphs/name/sameepsi/quickswap-v3" },
+  ];
+
+  const query = JSON.stringify({
+    query: `{
+      pools(first: 1000, orderBy: totalValueLockedUSD, orderByDirection: desc,
+            where: {totalValueLockedUSD_gt: "25000"}) {
+        token0 { symbol }
+        token1 { symbol }
+        token0Price
+        token1Price
+        totalValueLockedUSD
+      }
+    }`
+  });
+
+  async function querySubgraphChain(url) {
+    const parsed = new URL(url);
+    return new Promise((resolve, reject) => {
+      const body = Buffer.from(query);
+      const req = https.request({
+        hostname: parsed.hostname,
+        path: parsed.pathname,
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Content-Length": body.length },
+        timeout: 12000,
+      }, (res) => {
+        let data = "";
+        res.on("data", c => data += c);
+        res.on("end", () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+      });
+      req.on("error", reject);
+      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+      req.write(body);
+      req.end();
+    });
+  }
+
+  await Promise.all(subgraphs.map(async ({ chain, name, url }) => {
+    try {
+      const data = await querySubgraphChain(url);
+      const pools = data?.data?.pools || [];
+      const prices = {};
+
+      for (const pool of pools) {
+        const sym0 = pool.token0?.symbol?.toUpperCase();
+        const sym1 = pool.token1?.symbol?.toUpperCase();
+        if (!sym0 || !sym1) continue;
+
+        if (STABLES.has(sym1) && !STABLES.has(sym0)) {
+          const price = parseFloat(pool.token0Price);
+          if (price > 0 && !prices[sym0]) prices[sym0] = price;
+        } else if (STABLES.has(sym0) && !STABLES.has(sym1)) {
+          const price = parseFloat(pool.token1Price);
+          if (price > 0 && !prices[sym1]) prices[sym1] = price;
+        }
+      }
+
+      chainPrices[chain] = prices;
+      console.log(`  ✅ ${name}: ${Object.keys(prices).length} pairs`);
+    } catch (e) {
+      chainPrices[chain] = {};
+      console.error(`  ❌ ${name}: ${e.message}`);
+    }
+  }));
+
+  return chainPrices;
+}
+
+// ─── Bridge Cost Estimates ────────────────────────────────────────────────────
+const BRIDGE_COSTS = {
+  "ETH-ARB":     { cost: 2,  time: "2-5 min",  bridge: "Arbitrum Bridge / Across" },
+  "ETH-BASE":    { cost: 2,  time: "2-5 min",  bridge: "Base Bridge / Across" },
+  "ETH-POLYGON": { cost: 3,  time: "3-7 min",  bridge: "Stargate" },
+  "ETH-BSC":     { cost: 5,  time: "5-15 min", bridge: "Stargate / Wormhole" },
+  "ARB-BASE":    { cost: 1,  time: "2-4 min",  bridge: "Across" },
+  "ARB-POLYGON": { cost: 2,  time: "3-6 min",  bridge: "Stargate" },
+  "ARB-BSC":     { cost: 3,  time: "5-10 min", bridge: "Stargate" },
+  "BASE-POLYGON":{ cost: 2,  time: "3-6 min",  bridge: "Stargate" },
+  "BASE-BSC":    { cost: 3,  time: "5-10 min", bridge: "Stargate" },
+  "BSC-POLYGON": { cost: 2,  time: "3-7 min",  bridge: "Stargate" },
+};
+
+function getBridgeCost(chain1, chain2) {
+  const key1 = `${chain1}-${chain2}`;
+  const key2 = `${chain2}-${chain1}`;
+  return BRIDGE_COSTS[key1] || BRIDGE_COSTS[key2] || { cost: 5, time: "5-15 min", bridge: "Wormhole" };
+}
+
+// ─── Find Cross-Chain Opportunities ──────────────────────────────────────────
+function findCrossChainOpportunities(chainPrices) {
+  const chains = Object.keys(chainPrices);
+  const opportunities = [];
+  const checkedSymbols = new Set();
+
+  // Get all symbols that appear on 2+ chains
+  const allSymbols = new Set();
+  for (const chain of chains) {
+    for (const sym of Object.keys(chainPrices[chain])) {
+      allSymbols.add(sym);
+    }
+  }
+
+  for (const sym of allSymbols) {
+    if (CONFIG.excludeCoins?.has(sym)) continue;
+
+    const chainMarkets = [];
+    for (const chain of chains) {
+      const price = chainPrices[chain][sym];
+      if (price && price > 0) chainMarkets.push({ chain, price });
+    }
+
+    if (chainMarkets.length < 2) continue;
+
+    const sorted = [...chainMarkets].sort((a, b) => a.price - b.price);
+    const cheapest = sorted[0];
+    const mostExpensive = sorted[sorted.length - 1];
+    const spread = ((mostExpensive.price - cheapest.price) / cheapest.price) * 100;
+
+    if (spread < CONFIG.minSpreadPercent || spread > CONFIG.maxSpreadPercent) continue;
+
+    // Estimate net profit on $1000 trade after bridge fees
+    const bridge = getBridgeCost(cheapest.chain, mostExpensive.chain);
+    const grossProfit = 1000 * (spread / 100);
+    const netProfit = grossProfit - bridge.cost - 5; // $5 estimated gas both sides
+
+    opportunities.push({
+      symbol: sym,
+      buyChain: cheapest.chain,
+      buyPrice: cheapest.price,
+      sellChain: mostExpensive.chain,
+      sellPrice: mostExpensive.price,
+      spreadPercent: spread.toFixed(2),
+      bridge,
+      netProfitOn1000: netProfit.toFixed(2),
+      allChains: sorted,
+    });
+  }
+
+  return opportunities.sort((a, b) => parseFloat(b.spreadPercent) - parseFloat(a.spreadPercent));
+}
+
 // ─── Find Opportunities ───────────────────────────────────────────────────────
 function findOpportunities(allPrices) {
   const exchangeNames = Object.keys(allPrices);
@@ -416,6 +571,33 @@ async function alertOpportunity(opp) {
   await sendTelegram(msg);
 }
 
+
+async function alertCrossChain(opp) {
+  const chainList = opp.allChains
+    .map(c => `  • ${c.chain}: $${c.price.toFixed(8)}`)
+    .join("\n");
+
+  const profitable = parseFloat(opp.netProfitOn1000) > 0;
+  const profitEmoji = profitable ? "💰" : "⚠️";
+
+  const msg =
+    `🌉🌉 *CROSS-CHAIN OPPORTUNITY* 🌉🌉\n\n` +
+    `*Token:* ${opp.symbol}\n` +
+    `*Spread:* ${opp.spreadPercent}%\n\n` +
+    `✅ *BUY on ${opp.buyChain} DEX*\n` +
+    `   Price: $${opp.buyPrice.toFixed(8)}\n\n` +
+    `💸 *SELL on ${opp.sellChain} DEX*\n` +
+    `   Price: $${opp.sellPrice.toFixed(8)}\n\n` +
+    `🌉 *Bridge:* ${opp.bridge.bridge}\n` +
+    `⏱️ *Bridge time:* ${opp.bridge.time}\n` +
+    `💵 *Bridge cost:* ~$${opp.bridge.cost}\n\n` +
+    `${profitEmoji} *Est. net profit on $1,000:* $${opp.netProfitOn1000}\n\n` +
+    `📊 *Prices by chain:*\n${chainList}\n\n` +
+    `⚠️ _Prices move fast — verify before bridging_`;
+
+  await sendTelegram(msg);
+}
+
 // ─── Cooldown Tracker ─────────────────────────────────────────────────────────
 const alertedOpportunities = new Map();
 
@@ -449,6 +631,30 @@ async function scan() {
     Coinbase:  coinbase.status  === "fulfilled" ? coinbase.value  : {},
     "DEX":     dex.status       === "fulfilled" ? dex.value       : {},
   };
+
+  // Cross-chain scan
+  console.log("\n🌉 Fetching cross-chain DEX prices...");
+  const chainPrices = await fetchCrossChain();
+  const crossChainOpps = findCrossChainOpportunities(chainPrices);
+
+  if (crossChainOpps.length === 0) {
+    console.log(`  ✅ No cross-chain opportunities above ${CONFIG.minSpreadPercent}% found.`);
+  } else {
+    console.log(`  🎯 ${crossChainOpps.length} cross-chain opportunit${crossChainOpps.length === 1 ? "y" : "ies"} found!`);
+    for (const opp of crossChainOpps) {
+      const key = `XCHAIN-${opp.symbol}-${opp.buyChain}-${opp.sellChain}`;
+      const lastAlerted = alertedOpportunities.get(key) || 0;
+      const now = Date.now();
+      if (now - lastAlerted > CONFIG.alertCooldownMs) {
+        console.log(`  🌉 ${opp.symbol}: ${opp.spreadPercent}% | ${opp.buyChain} → ${opp.sellChain} | Net: $${opp.netProfitOn1000}/1k`);
+        alertedOpportunities.set(key, now);
+        await alertCrossChain(opp);
+      } else {
+        const left = Math.ceil((CONFIG.alertCooldownMs - (now - lastAlerted)) / 60000);
+        console.log(`  ⏳ ${opp.symbol} (XCHAIN): ${opp.spreadPercent}% (cooldown: ${left}m)`);
+      }
+    }
+  }
 
   const totalPrices  = Object.values(allPrices).reduce((s, ex) => s + Object.keys(ex).length, 0);
   const uniqueCoins  = new Set(Object.values(allPrices).flatMap(ex => Object.keys(ex))).size;
