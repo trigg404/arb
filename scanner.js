@@ -52,9 +52,22 @@ function httpGet(url, headers = {}) {
 
 async function fetchBinance() {
   const prices = {};
+  // Binance blocks some cloud IPs — try multiple fallback endpoints
+  const urls = [
+    "https://api.binance.com/api/v3/ticker/price",
+    "https://api1.binance.com/api/v3/ticker/price",
+    "https://api2.binance.com/api/v3/ticker/price",
+    "https://api3.binance.com/api/v3/ticker/price",
+  ];
+  let data = null;
+  for (const url of urls) {
+    try {
+      data = await httpGet(url);
+      if (Array.isArray(data) && data.length > 0) break;
+    } catch (e) { /* try next */ }
+  }
   try {
-    const data = await httpGet("https://api.binance.com/api/v3/ticker/price");
-    if (Array.isArray(data)) {
+    if (Array.isArray(data) && data.length > 0) {
       for (const t of data) {
         if (t.symbol.endsWith("USDT")) {
           const sym = t.symbol.slice(0, -4);
@@ -62,8 +75,10 @@ async function fetchBinance() {
           if (price > 0) prices[sym] = price;
         }
       }
+      console.log(`  ✅ Binance: ${Object.keys(prices).length} pairs`);
+    } else {
+      console.error("  ❌ Binance: All endpoints failed or IP is blocked");
     }
-    console.log(`  ✅ Binance: ${Object.keys(prices).length} pairs`);
   } catch (e) { console.error(`  ❌ Binance: ${e.message}`); }
   return prices;
 }
@@ -172,35 +187,28 @@ async function fetchKraken() {
 async function fetchCoinbase() {
   const prices = {};
   try {
-    // Get all USD product IDs first
-    const products = await httpGet("https://api.coinbase.com/api/v3/brokerage/products?product_type=SPOT");
-    const usdProducts = (products.products || [])
-      .filter(p => p.product_id.endsWith("-USD") && p.status === "online")
-      .map(p => p.product_id);
+    // Use public exchange API (no auth required)
+    const data = await httpGet("https://api.exchange.coinbase.com/products");
+    if (Array.isArray(data)) {
+      const usdProducts = data
+        .filter(p => p.quote_currency === "USD" && p.status === "online")
+        .map(p => p.id);
 
-    // Fetch best bid/ask in batches of 50
-    const batchSize = 50;
-    for (let i = 0; i < usdProducts.length; i += batchSize) {
-      const batch = usdProducts.slice(i, i + batchSize);
-      try {
-        const data = await httpGet(
-          `https://api.coinbase.com/api/v3/brokerage/best_bid_ask?product_ids=${batch.join(",")}`
-        );
-        if (data.pricebooks) {
-          for (const pb of data.pricebooks) {
-            const sym = pb.product_id.replace("-USD", "");
-            if (pb.asks?.[0]?.price) {
-              const ask = parseFloat(pb.asks[0].price);
-              const bid = parseFloat(pb.bids?.[0]?.price || pb.asks[0].price);
-              if (ask > 0) prices[sym] = (ask + bid) / 2;
-            }
-          }
-        }
-      } catch (batchErr) {
-        // skip failed batch
+      // Fetch tickers in batches of 20
+      const batchSize = 20;
+      for (let i = 0; i < usdProducts.length; i += batchSize) {
+        const batch = usdProducts.slice(i, i + batchSize);
+        await Promise.all(batch.map(async (productId) => {
+          try {
+            const ticker = await httpGet(`https://api.exchange.coinbase.com/products/${productId}/ticker`);
+            const sym = productId.replace("-USD", "");
+            const price = parseFloat(ticker.price);
+            if (price > 0) prices[sym] = price;
+          } catch (e) { /* skip */ }
+        }));
       }
+      console.log(`  ✅ Coinbase: ${Object.keys(prices).length} pairs`);
     }
-    console.log(`  ✅ Coinbase: ${Object.keys(prices).length} pairs`);
   } catch (e) { console.error(`  ❌ Coinbase: ${e.message}`); }
   return prices;
 }
